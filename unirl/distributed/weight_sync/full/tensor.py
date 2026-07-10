@@ -72,8 +72,14 @@ class TensorWeightSync(FullWeightSync):
         # SafeUnpickler). When both sglang and vllm are installed, detect the
         # engine kind from the rollout sibling so vLLM-Omni doesn't accidentally
         # use SGLang's reductions.
-        rollout_mod = type(self._rollout).__module__
-        use_sglang = "sglang" in rollout_mod and "vllm" not in rollout_mod
+        # Walk the MRO, not just the leaf class: recipe-side engine subclasses
+        # (e.g. train.mario_engine.MarioRolloutEngine) live outside unirl but
+        # inherit SGLangRolloutEngine — the leaf module alone misdetects them
+        # as non-sglang and ships unirl-pathed pickles the SafeUnpickler kills.
+        rollout_mods = [klass.__module__ for klass in type(self._rollout).__mro__]
+        use_sglang = any("sglang" in mod for mod in rollout_mods) and not any(
+            "vllm" in mod for mod in rollout_mods
+        )
         if use_sglang:
             try:
                 from sglang.srt.utils import MultiprocessingSerializer
