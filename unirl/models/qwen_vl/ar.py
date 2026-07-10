@@ -403,6 +403,28 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         if igt is not None:
             forward_kwargs["image_grid_thw"] = igt
 
+        # Only response positions are scored, so run the lm_head at exactly those
+        # positions (transformers accepts an index tensor — same convention as
+        # packed_replay's predict_index) instead of materializing [B, L, vocab]
+        # over the whole padded sequence. The scored set per row is its last real
+        # prompt token (predicts the first response token) plus the shared
+        # response block [max_real_len, max_real_len + T_max); their union is
+        # tight for ANY prompt raggedness and any multimodal layout — image
+        # count/placement only changes what is inside the prompt block, which is
+        # never scored (`real_lens` already counts every vision token). The two
+        # groups never overlap (real_len - 1 < max_real_len), so the index is
+        # `firsts` then the block, and the block's slots stay contiguous.
+        first_slot: Dict[int, int] = {}
+        block_slot0 = 0
+        if T_max > 0:
+            firsts = sorted({int(real_lens[b].item()) - 1 for b in range(batch_size) if lengths[b] > 0})
+            first_slot = {pos: slot for slot, pos in enumerate(firsts)}
+            block_slot0 = len(firsts)
+            keep_positions = torch.tensor(
+                firsts + list(range(max_real_len, max_real_len + T_max)), dtype=torch.long, device=device
+            )
+            forward_kwargs["logits_to_keep"] = keep_positions
+
         # Compute correct 4D position_ids for M-RoPE.
         # Rollout uses prepare_inputs_for_generation which produces [4, bs, seq]:
         #   row 0 = text positions (for causal mask), rows 1-3 = M-RoPE (temporal, height, width).
@@ -437,11 +459,13 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
             n = lengths[b]
             if n == 0:
                 continue
-            real_len_b = int(real_lens[b].item())
+            # Logits come back in keep_positions order: this row's prompt-final
+            # slot, then the shared contiguous response-block slots.
+            fs = first_slot[int(real_lens[b].item()) - 1]
             # First generated token: logit from last real prompt token
-            first_logit = logits[b, real_len_b - 1 : real_len_b, :]  # [1, V]
+            first_logit = logits[b, fs : fs + 1, :]  # [1, V]
             # Subsequent generated tokens: logits from generated-token positions
-            rest_logits = logits[b, max_real_len : max_real_len + n - 1, :] if n > 1 else logits[b, :0, :]
+            rest_logits = logits[b, block_slot0 : block_slot0 + n - 1, :] if n > 1 else logits[b, :0, :]
             pred_logits_b = torch.cat([first_logit, rest_logits], dim=0)  # [n, V]
             # GRPO injects the rollout sampling temperature so replay's
             # log-softmax matches the sampling distribution (logits / T).
