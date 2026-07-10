@@ -245,12 +245,29 @@ class TrainStack(Remote):
 
         single_micro = len(micros) == 1 and micros[0] == (0, bs)
         last_micro = len(micros) - 1
+        # One-ahead conditions prefetch: an algorithm may expose
+        # ``prefetch_conditions(conditions_dict)`` when its conditions class
+        # rebuilds heavy per-micro inputs (e.g. pixel_values from compact
+        # frames) — the NEXT micro is sliced early and handed to the hook so
+        # that CPU work overlaps this micro's GPU compute. The pre-sliced track
+        # is then reused for the next iteration (the hook keys its cache on
+        # tensor identity). Without the hook, slicing is lazy as before.
+        prefetch = getattr(self.algorithm, "prefetch_conditions", None)
+        prefetched_track = None
         for i, (start, end) in enumerate(micros):
             # Defer the per-block gradient reduce-scatter to the last micro-batch so
             # it runs once per optimizer step instead of once per micro-batch (no-op
             # unless defer_grad_sync + ZeRO-2). Must precede the backward.
             self.fsdp_backend.set_grad_sync(i == last_micro)
-            micro_track = resp_track if single_micro else resp_track.slice(start, end)
+            if prefetched_track is not None:
+                micro_track = prefetched_track
+                prefetched_track = None
+            else:
+                micro_track = resp_track if single_micro else resp_track.slice(start, end)
+            if prefetch is not None and i < last_micro:
+                next_start, next_end = micros[i + 1]
+                prefetched_track = resp_track.slice(next_start, next_end)
+                prefetch(prefetched_track.conditions)
             # Sample-share weighting: the algorithm's micro loss is a MEAN over the
             # micro's sequences (seq-mean agg modes), so the update gradient equals
             # the whole-update mean only when each micro is weighted by its share of
