@@ -136,6 +136,19 @@ def _merge_igt(per_sample_igt: Optional[List[Optional[torch.Tensor]]]) -> Option
     return torch.cat(parts, dim=0) if parts else None
 
 
+def _mm_token_type_ids(transformer: Any, input_ids: torch.Tensor) -> torch.Tensor:
+    """Rebuild the processor's ``mm_token_type_ids`` (text=0 / image=1 / video=2)."""
+    cfg = transformer.config
+    mm_token_type_ids = torch.zeros_like(input_ids)
+    image_token_id = getattr(cfg, "image_token_id", None)
+    video_token_id = getattr(cfg, "video_token_id", None)
+    if image_token_id is not None:
+        mm_token_type_ids[input_ids == image_token_id] = 1
+    if video_token_id is not None:
+        mm_token_type_ids[input_ids == video_token_id] = 2
+    return mm_token_type_ids
+
+
 def _vision_rope_positions(
     transformer: Any,
     input_ids: torch.Tensor,
@@ -154,15 +167,7 @@ def _vision_rope_positions(
     get_rope_index = transformer.model.get_rope_index
     kwargs = {"image_grid_thw": image_grid_thw, "attention_mask": attention_mask}
     if "mm_token_type_ids" in inspect.signature(get_rope_index).parameters:
-        cfg = transformer.config
-        mm_token_type_ids = torch.zeros_like(input_ids)
-        image_token_id = getattr(cfg, "image_token_id", None)
-        video_token_id = getattr(cfg, "video_token_id", None)
-        if image_token_id is not None:
-            mm_token_type_ids[input_ids == image_token_id] = 1
-        if video_token_id is not None:
-            mm_token_type_ids[input_ids == video_token_id] = 2
-        position_ids, _ = get_rope_index(input_ids, mm_token_type_ids, **kwargs)
+        position_ids, _ = get_rope_index(input_ids, _mm_token_type_ids(transformer, input_ids), **kwargs)
     else:
         position_ids, _ = get_rope_index(input_ids, **kwargs)
     return position_ids
@@ -225,17 +230,27 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         pv = _merge_pv(conditions.pixel_values)
         igt = _merge_igt(conditions.image_grid_thw)
 
+        # Mirror ``generate()``'s model_kwargs contract (transformers >= 5.6): the caller
+        # owns attention_mask / position_ids / mm_token_type_ids across steps, and
+        # ``_update_model_kwargs_for_generation`` grows them while
+        # ``prepare_inputs_for_generation`` slices them to the new tokens. Two things
+        # this fixes over hand-rolled kwargs: ``cache_position`` is no longer refreshed
+        # by transformers (a stale prefill-length one corrupts every step after the
+        # first), and M-RoPE positions after an image are only right when
+        # ``position_ids`` is seeded here — the text model's fallback ignores
+        # ``rope_deltas`` and mis-sizes the causal mask.
         model_kwargs: Dict[str, Any] = {
             "attention_mask": attention_mask,
             "use_cache": True,
             "past_key_values": None,
-            "cache_position": torch.arange(int(input_ids.shape[1]), device=device, dtype=torch.long),
         }
 
         if pv is not None:
             model_kwargs["pixel_values"] = pv
         if igt is not None:
             model_kwargs["image_grid_thw"] = igt
+            model_kwargs["mm_token_type_ids"] = _mm_token_type_ids(transformer, input_ids)
+        model_kwargs["position_ids"] = transformer._prepare_position_ids_for_generation(input_ids, model_kwargs)
 
         cur_input_ids = input_ids
 
@@ -245,22 +260,16 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         is_first_step = True
 
         for _ in range(max_new):
-            prep_kwargs: Dict[str, Any] = {
-                "past_key_values": model_kwargs.get("past_key_values"),
-                "attention_mask": model_kwargs.get("attention_mask"),
-                "cache_position": model_kwargs.get("cache_position"),
-                "use_cache": True,
-            }
-            if is_first_step:
-                if "pixel_values" in model_kwargs:
-                    prep_kwargs["pixel_values"] = model_kwargs["pixel_values"]
-                if "image_grid_thw" in model_kwargs:
-                    prep_kwargs["image_grid_thw"] = model_kwargs["image_grid_thw"]
-                prep_kwargs["is_first_iteration"] = True
-            else:
-                prep_kwargs["is_first_iteration"] = False
-
-            model_inputs = transformer.prepare_inputs_for_generation(cur_input_ids, **prep_kwargs)
+            # ``next_sequence_length`` tells prepare_inputs how many trailing tokens are
+            # new; without it the whole sequence is re-fed against a populated cache
+            # (transformers/generation/utils.py: next_sequence_length = 1). Qwen's own
+            # ``prepare_inputs_for_generation`` nulls pixel_values past the prefill.
+            model_inputs = transformer.prepare_inputs_for_generation(
+                cur_input_ids,
+                next_sequence_length=None if is_first_step else 1,
+                is_first_iteration=is_first_step,
+                **model_kwargs,
+            )
 
             with torch.no_grad():
                 out = transformer(**model_inputs, return_dict=True)

@@ -75,6 +75,10 @@ def _store_shape(t: torch.Tensor) -> torch.Tensor:
 def _restore(val: Any, orig_shape: Optional[Tuple[int, ...]]) -> Any:
     """Reshape a fetched tensor back to the shape it was put with (a no-op unless
     the backend altered it — e.g. the 0-dim → (1,) reshape on put)."""
+    # transferqueue >= 0.1.6 returns row-wise fields as a NestedTensor; densify first
+    # (rows are equal-length here, since _pad_row only ever adds a trailing singleton).
+    if isinstance(val, torch.Tensor) and val.is_nested:
+        val = torch.stack(list(val.unbind()))
     if orig_shape is not None and isinstance(val, torch.Tensor) and val.shape != orig_shape:
         return val.reshape(orig_shape)
     return val

@@ -88,6 +88,10 @@ class Image:
     def to_pil(self) -> PIL.Image.Image:
         from torchvision.transforms.functional import to_pil_image
 
+        # uint8 is already the PIL byte range; clamping it to [0, 1] would flatten the
+        # image. Carrying frames as uint8 is 4x cheaper to stack and ship than float32.
+        if self.pixels.dtype == torch.uint8:
+            return to_pil_image(self.pixels)
         return to_pil_image(self.pixels.clamp(0.0, 1.0))
 
 
