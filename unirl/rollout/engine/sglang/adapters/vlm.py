@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+import torch
+
 from unirl.config.require import require
 from unirl.rollout.engine.sglang.adapters.base import (
     MMEncoding,
@@ -128,7 +130,12 @@ class VLMAdapter(TextLMAdapter):
         conditions = super().build_conditions(req, prepared, raw)
         if prepared.mm:
             _, prompt_index = self.replicate_per_sample(prepared)
-            per_sample_pixel_values = [prepared.mm[i].pixel_values for i in prompt_index]
+            # bf16, matching what the trainside chat_template ships and what the model
+            # casts to anyway — the processor's fp32 doubles every downstream copy.
+            per_sample_pixel_values = [
+                None if prepared.mm[i].pixel_values is None else prepared.mm[i].pixel_values.to(torch.bfloat16)
+                for i in prompt_index
+            ]
             per_sample_image_grid_thw = [prepared.mm[i].image_grid_thw for i in prompt_index]
             if any(p is not None for p in per_sample_pixel_values):
                 conditions["pixel_values"] = per_sample_pixel_values
