@@ -250,8 +250,11 @@ class TrainStack(Remote):
         # rebuilds heavy per-micro inputs (e.g. pixel_values from compact
         # frames) — the NEXT micro is sliced early and handed to the hook so
         # that CPU work overlaps this micro's GPU compute. The pre-sliced track
-        # is then reused for the next iteration (the hook keys its cache on
-        # tensor identity). Without the hook, slicing is lazy as before.
+        # is reused for the next iteration, so the SAME conditions dict object
+        # reaches the algorithm: hooks should stash their in-flight work on
+        # that dict (NOT in a registry keyed by tensor identity — recycled
+        # ``id()``s both leak entries and can serve another micro's data).
+        # Without the hook, slicing is lazy as before.
         prefetch = getattr(self.algorithm, "prefetch_conditions", None)
         prefetched_track = None
         for i, (start, end) in enumerate(micros):
