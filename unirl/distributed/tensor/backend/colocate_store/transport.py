@@ -18,7 +18,7 @@ are already correct (and local).
 
 from __future__ import annotations
 
-from typing import Any, List
+from typing import Any, Dict, List
 
 import ray
 import torch
@@ -39,10 +39,22 @@ class ColocateStoreTransport(WorkerLocalTransport):
         return self._store
 
     def _resolve_handles(self, handles: List[ColocateTensorHandle]) -> List[torch.Tensor]:
+        # Dedup identical object_refs WITHIN the call (the base-class contract:
+        # "backends batch and dedup internally"). A fragmented ref — e.g. an
+        # advantage-filtered track — carries thousands of single-row spans over
+        # a handful of source objects, and ``ray.get`` deserializes a FRESH
+        # copy of a torch tensor on every call; resolving per-span without the
+        # memo turns one hydration into O(spans x object_size) bytes of copies
+        # (each slice also pins its base's storage until the assembling cat),
+        # quadratic in batch rows — observed as ~600 GB per worker and a
+        # node-level OOM at 74k-row batches.
+        materialized: Dict[Any, torch.Tensor] = {}
         out: List[torch.Tensor] = []
         for h in handles:
             if h.object_ref is not None:
-                out.append(ray.get(h.object_ref).detach())
+                if h.object_ref not in materialized:
+                    materialized[h.object_ref] = ray.get(h.object_ref).detach()
+                out.append(materialized[h.object_ref])
             elif h.source_id != self._store.worker_id:
                 raise RuntimeError(
                     f"ColocateStoreTransport: handle from '{h.source_id}' is not local to "
